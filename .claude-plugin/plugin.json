@@ -1,0 +1,9 @@
+{
+  "name": "seats",
+  "version": "0.1.0",
+  "description": "Lead and orchestrator seats for Claude Code in Herdr: seat tools (open, send, list, hand over, close), a zero-token context watch that tells the Lead when an orchestrator passes 350k and 450k, and the rituals that run a fleet (lead, run-phases, briefs, handover, checkpoint, away).",
+  "license": "MIT",
+  "author": {
+    "name": "Busy Elves"
+  }
+}

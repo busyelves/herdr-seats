@@ -1,0 +1,5 @@
+{
+  "name": "herdr-seats",
+  "owner": { "name": "Busy Elves" },
+  "plugins": [{ "name": "seats", "source": "./" }]
+}

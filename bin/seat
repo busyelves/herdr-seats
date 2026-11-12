@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""seat: open, message, list, hand over and close agent seats in Herdr, by the naming law.
+
+Every routine seat action goes through this one command so the conventions live in
+code: the name, the pane beside the caller, the agent's two names set at once, the
+message header, the successor order. Raw `herdr` stays for anything unusual.
+
+Two names per seat. The Herdr name is the address (`app-cc-lead`): it moves to the
+successor at a handover, so every seat reaches whoever holds the role. The title
+(`app-cc-lead-2610-0546`, day, month, time of opening) is the seat's own: the Claude
+session name and the Herdr pane label, set once and never moved. A target may be either.
+
+  seat open orch replies --brief f.md   open app-cc-orch-replies beside this pane, send f.md
+  seat open lead --successor            open app-cc-lead-next beside this pane
+  seat name lead                        name this pane app-cc-lead (a seat opened by hand)
+  seat send replies f.md --about plan-live-replies
+  seat send lead -                      message from stdin
+  seat list [--all]                     this repo's seats (every repo with --all)
+  seat handover replies --pointer p.md      successor takes the name; the old pane closes
+  seat handover lead --pointer p.md         successor takes the name; the old seat stays as <name>-advisor
+  seat handover lead --pointer p.md --close a Lead reset with no advisor
+  seat close replies [--force]
+
+In the Herdr app (a herdr-core terminal: $HC_TERMINAL_ID, no Herdr TUI pane) the same commands
+work through `hc` and `herdr-app`: a seat's names live in its terminal's labels (seat.name,
+seat.title), since herdr-core names never move. Inside a Herdr TUI pane nothing changes.
+
+Names are `<repo>-<harness>-<role>[-<word>]`: repo from the `<repo>-work/` folder (or the
+git checkout), harness `cc` (Claude Code) or `cx` (Codex), role `lead`, `orch` or `impl`,
+one word for the run (an orchestrator must have one). Herdr caps names at 32 characters.
+A target may be the full name, the word (`replies`) or the role (`lead`) when unique in
+this repo. Exit status: 0 done, 2 usage or naming error, 3 refused (target busy, blocked,
+not found, or holding the owner's unsent text past two minutes), 4 Herdr failed.
+
+A Claude seat starts on the plan of the seat that opens it (`a` = `claude`, `b` = `claude-b`,
+from its terminal's claude.plan label or its config folder); a handover keeps the old seat's plan;
+`--plan` overrides. A `b` seat opens only in the Herdr app.
+
+`--model` and `--effort` choose what the new seat runs on (`--model fable --effort high`, or a full
+model ID). Without them a new seat or successor runs on Opus 5.5 at high effort, whatever the
+account's own default or the opening seat's model.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROLES = ("lead", "orch", "impl")
+HARNESS = {"cc": "claude", "cx": "codex"}
+# Claude plans, named by account: `a` is `claude`, the main subscription; `b` is `claude-b`, the second
+# (~/.claude-b).
+# A seat starts on the plan of the seat that opens or hands it over, unless --plan says otherwise:
+# artifacts are private to an account, so a run that switches plans loses its own pages.
+PLANS = {"a": "claude", "b": "claude-b"}
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_MODEL, DEFAULT_EFFORT = "claude-opus-5-5", "high"
+MODEL = re.compile(r"[A-Za-z0-9][\w.\[\]-]*")
+NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+WORD = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)?$")
+CONTEXT_TOKEN = "seat_context"
+SHELL_WAIT_TRIES = 3 if os.environ.get("SEAT_TEST_FAST") else 30  # half-second tries for a fresh shell
+DRAFT_WAIT = (0.1, 3) if os.environ.get("SEAT_TEST_FAST") else (2, 60)  # seconds per look, looks before giving up
+# A draft wait ends by this many seconds, under the seats mod's 120 s run limit, so the caller hears why.
+DRAFT_LIMIT = float(os.environ.get("SEAT_DRAFT_WAIT") or (1 if os.environ.get("SEAT_TEST_FAST") else 90))
+RULE = re.compile(r"^\s*─{20,}( .* ─+)?\s*$")  # a named session carries its name in the top rule
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+CSI = re.compile(r"\x1b\[[0-9;?=!]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)")  # colour, cursor, erase and OSC codes
+
+
+class SeatError(Exception):
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+# ---- naming (pure, tested) ---------------------------------------------------------
+
+def title_of(name, now=None):
+    """The seat's own name: its address at birth (a successor's without -next) plus day, month, time."""
+    base = name[:-len("-next")] if name.endswith("-next") else name
+    when = now.strftime("%d%m-%H%M") if now else os.environ.get("SEAT_TEST_NOW") or datetime.now().strftime("%d%m-%H%M")
+    return f"{base}-{when}"
+
+
+def repo_of(path):
+    """The repo a path belongs to: the `<repo>-work` folder above it, else its git checkout."""
+    p = Path(path).resolve()
+    for part in [p, *p.parents]:
+        if part.name.endswith("-work") and len(part.name) > 5:
+            return part.name[:-5].lower()
+    try:
+        top = subprocess.run(["git", "-C", str(p), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        return Path(top).name.lower()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return p.name.lower()
+
+
+def work_root(path):
+    """The `<repo>-work` folder above a path, where seats start; else the path itself."""
+    p = Path(path).resolve()
+    for part in [p, *p.parents]:
+        if part.name.endswith("-work") and len(part.name) > 5:
+            return str(part)
+    return str(p)
+
+
+def seat_name(repo, harness, role, word=None, successor=False):
+    if harness not in HARNESS:
+        raise SeatError(f"harness must be one of {', '.join(HARNESS)}, not {harness!r}")
+    if role not in ROLES:
+        raise SeatError(f"role must be one of {', '.join(ROLES)}, not {role!r}")
+    if role == "orch" and not word:
+        raise SeatError("an orchestrator needs one word for its run: seat open orch <word>")
+    if word and not WORD.match(word):
+        raise SeatError(f"the run word is lowercase letters and digits, one word (two joined by '-' "
+                        f"only when one is ambiguous), not {word!r}")
+    name = "-".join(x for x in (repo, harness, role, word) if x) + ("-next" if successor else "")
+    if not NAME.match(name):
+        room = 32 - len(name) + len(word or "")
+        hint = f"; the run word may be {room} characters here" if word and room > 0 else ""
+        raise SeatError(f"{name!r} breaks Herdr's name rule (lowercase, at most 32 characters){hint}")
+    return name
+
+
+def resolve(target, agents, repo):
+    """A live agent by full name, by run word or by role, within this repo when ambiguous."""
+    names = [a["name"] for a in agents if a.get("name")]
+    if target in names:
+        return target
+    titled = [a["name"] for a in agents if a.get("name") and target in (a.get("terminal_title_stripped"), a.get("label"))]
+    if len(titled) == 1:
+        return titled[0]
+    hits = [n for n in names if n.endswith("-" + target) or n.endswith("-" + target + "-next")
+            or re.search(rf"-(cc|cx|claude|codex)-{re.escape(target)}\d*$", n)]
+    local = [n for n in hits if n.startswith(repo + "-")]
+    pick = local or hits
+    # A successor waiting as <name>-next never shadows the seat that still holds the name.
+    if len(pick) > 1:
+        pick = [n for n in pick if not n.endswith("-next")] or pick
+    if len(pick) == 1:
+        return pick[0]
+    if not pick:
+        raise SeatError(f"no live seat matches {target!r}; live: {', '.join(names) or 'none'}", 3)
+    raise SeatError(f"{target!r} is ambiguous: {', '.join(pick)}; use the full name", 2)
+
+
+def with_header(body, repo, about, sender):
+    """The seat convention: first line `<repo> · <tracker> · …`, and who is asking."""
+    first = body.lstrip().splitlines()[0] if body.strip() else ""
+    if first.startswith(repo + " · "):
+        return body if sender in body[:400] else body.rstrip() + f"\n\n(from {sender})"
+    return f"{repo} · {about or 'note'} · from {sender}\n\n{body.strip()}"
+
+
+def split_direction(rect):
+    """Right when both halves keep 80 columns, else down."""
+    return "right" if rect["width"] >= 160 else "down"
+
+
+# ---- herdr ---------------------------------------------------------------------------
+
+# The Herdr app: in one of its terminals, with no Herdr TUI pane around it.
+APP = bool(os.environ.get("HC_TERMINAL_ID")) and not (os.environ.get("HERDR_ENV") == "1" and os.environ.get("HERDR_PANE_ID"))
+
+
+OWN = "app" if APP else "tui"
+# Each world is reached only while its server listens, so a call from one never starts the other.
+SOCKETS = {"tui": os.environ.get("SEAT_HERDR_SOCK") or str(Path.home() / ".config/herdr/herdr.sock"),
+           "app": os.environ.get("SEAT_HC_SOCK") or str(Path.home() / ".local/state/herdr-core/default/default.sock")}
+APP_ADDRESS = re.compile(r"([a-z0-9_.-]+/)?t[0-9a-z]+")
+WORLD = {}  # seat name or pane id -> "tui" | "app", filled as seats are listed, started and renamed
+
+
+def here():
+    """This seat's pane: the Herdr TUI pane id, or in the app its terminal's address."""
+    return os.environ["HC_TERMINAL_ID"] if APP else os.environ.get("HERDR_PANE_ID")
+
+
+def listening(path):
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def worlds():
+    """This seat's own world, then the other one while its server runs (TUI seats and app seats talk)."""
+    other = "tui" if APP else "app"
+    return [OWN] + ([other] if listening(SOCKETS[other]) else [])
+
+
+def world_of(target):
+    if target in WORLD:
+        return WORLD[target]
+    if APP_ADDRESS.fullmatch(target or ""):
+        return "app"
+    if ":" in (target or ""):
+        return "tui"
+    return OWN
+
+
+def herdr(*args, check=True):
+    """A Herdr call, sent to the world its target lives in: the TUI's herdr or the app's hc."""
+    head = list(args[:2])
+    target = args[3] if head == ["pane", "layout"] else \
+        args[args.index("--pane") + 1] if head == ["agent", "start"] else args[2] if len(args) > 2 else None
+    world = world_of(target) if target else OWN
+    if head == ["agent", "start"]:
+        WORLD[args[2]] = world
+    if head == ["agent", "rename"] and args[3] != "--clear":
+        WORLD[args[3]] = world
+    if world == "app":
+        return app_herdr(*args, check=check)
+    return tui_herdr(*args, check=check)
+
+
+def tui_herdr(*args, check=True):
+    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        if not check:
+            return None
+        try:
+            err = json.loads(p.stderr or p.stdout)["error"]
+            raise SeatError(f"herdr {' '.join(args[:2])}: {err.get('code')}: {err.get('message')}", 4)
+        except (ValueError, KeyError, TypeError):
+            raise SeatError(f"herdr {' '.join(args[:2])} failed: {(p.stderr or p.stdout).strip()[:300]}", 4)
+    out = p.stdout.strip()
+    return json.loads(out).get("result") if out.startswith("{") else out
+
+
+# ---- the Herdr app: the herdr calls above, answered by hc and herdr-app -------------------
+
+def tool(name):
+    return shutil.which(name) or str(Path.home() / ".local/bin" / name)
+
+
+def app_window():
+    """The app home of a running Herdr window: $HERDR_APP_HOME, else the first that listens
+    (`~/.config/herdr-app`, then copies such as `herdr-app-<name>`). Every window shows
+    the same core, so any open one will do."""
+    if os.environ.get("HERDR_APP_HOME"):
+        return os.environ["HERDR_APP_HOME"]
+    base = Path.home() / ".config/herdr-app"
+    for home in [base, *sorted(base.parent.glob("herdr-app-*"))]:
+        if listening(str(home / "herdr-app.sock")):
+            return str(home)
+    return None
+
+
+def app_run(*argv, check=True):
+    env = None
+    if Path(argv[0]).name == "herdr-app" and (home := app_window()):
+        env = {**os.environ, "HERDR_APP_HOME": home}
+    p = subprocess.run(list(argv), capture_output=True, text=True, env=env)
+    if p.returncode != 0:
+        if not check:
+            return None
+        raise SeatError(f"{Path(argv[0]).name} {' '.join(argv[1:3])} failed: {(p.stderr or p.stdout).strip()[:300]}", 4)
+    out = p.stdout.strip()
+    return json.loads(out) if out.startswith(("{", "[")) else out
+
+
+def hc(*args, check=True):
+    return app_run(tool("hc"), *args, check=check)
+
+
+def app_agents():
+    """Live agent terminals, shaped as `herdr agent list` shapes them; names from their labels."""
+    out = []
+    for t in hc("ls", "--json")["terminals"]:
+        if t.get("state") != "live" or not t.get("status"):
+            continue
+        g = hc("get", t["address"], check=False) or {}
+        labels = g.get("labels") or {}
+        program = t.get("agent") or ""
+        ctx = labels.get("agent.ctx")
+        sid = (labels.get("agent.session") or "").partition(":")[2]
+        out.append({"name": labels.get("seat.name") or None, "pane_id": t["address"], "agent_status": t["status"],
+                    "agent": "codex" if "codex" in program else "claude" if "claude" in program else program,
+                    "cwd": t.get("cwd"), "terminal_title_stripped": labels.get("seat.title") or g.get("title"),
+                    "label": labels.get("seat.title"), "cols": g.get("cols") or 0,
+                    "tokens": {CONTEXT_TOKEN: f"{round(int(ctx) / 1000)}k"} if ctx and ctx.isdigit() else {},
+                    "agent_session": {"value": sid} if sid else None, "plan": labels.get("claude.plan")})
+    return out
+
+
+def app_address(target):
+    """A terminal address from a seat name, or the address itself."""
+    if APP_ADDRESS.fullmatch(target):
+        return target
+    hit = next((a["pane_id"] for a in app_agents() if a["name"] == target), None)
+    if not hit:
+        raise SeatError(f"no live seat is named {target!r}", 3)
+    return hit
+
+
+def app_pane(address):
+    """The app's pane showing a terminal, if one does."""
+    shown = app_run(tool("herdr-app"), "ls", check=False) or {}
+    for space in shown.get("spaces", []):
+        for tab in space.get("tabs", []):
+            for t in tab.get("terminals", []):
+                if t.get("terminal") == address:
+                    return t.get("pane")
+    return None
+
+
+def app_screen(address, quiet=0.4, most=4.0):
+    """A terminal's screen with its colours, as the TUI's `pane read --format ansi` gives it.
+
+    `hc read` is plain text, where a typed draft can't be told from Claude's grey hint; a
+    watch-only attach (it never types or resizes) first paints the whole screen in colour.
+    """
+    import pty
+    import select
+    import signal
+    try:
+        pid, fd = pty.fork()
+    except OSError:
+        return None
+    if pid == 0:
+        try:
+            os.execv(tool("hc"), ["hc", "attach", "--observe", address])
+        finally:
+            os._exit(127)
+    # attach first asks the viewer's colours, cell size and kind, and paints once answered.
+    answers = {b"\x1b]10;?": b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\", b"\x1b]11;?": b"\x1b]11;rgb:0000/0000/0000\x1b\\",
+               b"\x1b]12;?": b"\x1b]12;rgb:ffff/ffff/ffff\x1b\\", b"\x1b[16t": b"\x1b[6;20;10t", b"\x1b[c": b"\x1b[?62;22c"}
+    buf, start, last, answered = b"", time.time(), None, set()
+    try:
+        while time.time() - start < most and (last is None or time.time() - last < quiet):
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                for ask, reply in answers.items():
+                    if ask in buf and ask not in answered:
+                        answered.add(ask)
+                        os.write(fd, reply)
+                # The quiet clock starts with the paint (it clears the screen), not with the questions.
+                if b"\x1b[2J" in buf:
+                    last = time.time()
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        os.waitpid(pid, 0)
+        os.close(fd)
+    return buf.decode("utf-8", "replace").replace("\r", "") or None
+
+
+def app_herdr(*args, check=True):
+    """Each herdr call the commands make, done in the Herdr app."""
+    head = list(args[:2])
+    if head == ["agent", "list"]:
+        return {"agents": app_agents()}
+    if head == ["pane", "layout"]:
+        pane = args[3]
+        cols = (hc("get", pane, check=False) or {}).get("cols") or 0
+        return {"layout": {"panes": [{"pane_id": pane, "rect": {"width": cols}}]}}
+    if head == ["pane", "split"]:
+        beside, direction, cwd = args[2], args[args.index("--direction") + 1], args[args.index("--cwd") + 1]
+        before = {t["address"] for t in hc("ls", "--json")["terminals"]}
+        spec = {"direction": direction, "argv": ["/bin/zsh", "-lc", f"cd {shlex.quote(cwd)} && exec /bin/zsh -l"]}
+        pane = app_pane(beside)
+        if pane:
+            spec["pane"] = pane
+        app_run(tool("herdr-app"), "do", "pane.split", json.dumps(spec))
+        for _ in range(SHELL_WAIT_TRIES * 2):
+            new = [t["address"] for t in hc("ls", "--json")["terminals"] if t["address"] not in before]
+            if new:
+                return {"pane": {"pane_id": new[0]}}
+            time.sleep(0.25)
+        raise SeatError("herdr-app pane.split made no terminal", 4)
+    if head == ["agent", "start"]:
+        name, kind, pane = args[2], args[args.index("--kind") + 1], args[args.index("--pane") + 1]
+        native = list(args[args.index("--") + 1:]) if "--" in args else []
+        timeout = int(args[args.index("--timeout") + 1]) / 1000 if "--timeout" in args else 60
+        plan = next((k for k, v in PLANS.items() if v == kind), None)
+        chosen = [f"claude.{k}={native[native.index('--' + k) + 1]}" for k in ("model", "effort") if "--" + k in native]
+        hc("label", pane, f"seat.name={name}", *([f"claude.plan={plan}"] if plan else []), *chosen)
+        hc("send", pane, " ".join(shlex.quote(x) for x in [kind, *native]))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            t = hc("get", pane, check=False) or {}
+            state = (t.get("status") or {}).get("state")
+            if state == "blocked":
+                raise SeatError("agent_not_ready: blocked during startup", 4)
+            if state:
+                return {}
+            time.sleep(0.5)
+        raise SeatError("agent_not_ready: no status from the agent", 4)
+    if head == ["pane", "rename"]:
+        return hc("label", args[2], f"seat.title={args[3]}", check=check)
+    if head == ["pane", "close"]:
+        pane = app_pane(args[2])
+        if pane:
+            return app_run(tool("herdr-app"), "do", "pane.close", json.dumps({"pane": pane}), check=check)
+        return hc("kill", args[2], check=check)
+    if head == ["pane", "read"]:
+        return app_screen(args[2])
+    if head == ["agent", "prompt"]:
+        return hc("send", app_address(args[2]), args[3], check=check)
+    if head == ["agent", "wait"]:
+        secs = int(args[args.index("--timeout") + 1]) // 1000 if "--timeout" in args else 600
+        return hc("wait", app_address(args[2]), "--timeout", str(max(1, secs)), check=check)
+    if head == ["agent", "rename"]:
+        address = app_address(args[2])
+        return hc("label", address, "seat.name=" if args[3] == "--clear" else f"seat.name={args[3]}", check=check)
+    raise SeatError(f"herdr {' '.join(args[:2])} has no Herdr app equivalent", 4)
+
+
+def require_herdr():
+    if APP:
+        return
+    if os.environ.get("HERDR_ENV") != "1" or not os.environ.get("HERDR_PANE_ID"):
+        raise SeatError("not inside a Herdr pane (HERDR_ENV=1 and HERDR_PANE_ID are required)", 3)
+
+
+def agents():
+    """Every live seat this seat can reach: its own world's, then the other world's while it runs."""
+    out = []
+    for world in worlds():
+        try:
+            got = app_agents() if world == "app" else tui_herdr("agent", "list")["agents"]
+        except SeatError:
+            if world == OWN:
+                raise
+            continue
+        for a in got:
+            a["world"] = world
+            WORLD[a.get("pane_id")] = world
+            if a.get("name"):
+                WORLD[a["name"]] = world
+        out += got
+    return out
+
+
+def me(live):
+    pane = here()
+    return next((a.get("name") for a in live if a.get("pane_id") == pane and a.get("name")), None) or pane
+
+
+def by_name(live, name):
+    return next(a for a in live if a.get("name") == name)
+
+
+def own_plan(live=None):
+    """This seat's Claude plan: its terminal's claude.plan label in the app, else its config folder."""
+    mine = next((a for a in live or [] if a.get("pane_id") == here()), {})
+    if mine.get("plan") in PLANS:
+        return mine["plan"]
+    home = os.environ.get("CLAUDE_CONFIG_DIR", "").rstrip("/")
+    return "b" if home and Path(home).expanduser() == Path.home() / ".claude-b" else "a"
+
+
+def pane_rect(pane):
+    layout = herdr("pane", "layout", "--pane", pane)["layout"]
+    return next(p["rect"] for p in layout["panes"] if p["pane_id"] == pane)
+
+
+def read_text(source):
+    if source in (None, ""):
+        return ""
+    return sys.stdin.read() if source == "-" else Path(source).read_text()
+
+
+def run_on(a):
+    """The model and effort a new Claude seat starts with: the flags, else the default pair."""
+    if a.model and not MODEL.fullmatch(a.model):
+        raise SeatError(f"--model {a.model!r} is not a model name: an alias (opus, fable, sonnet, haiku) or a full ID")
+    return a.model or DEFAULT_MODEL, a.effort or DEFAULT_EFFORT
+
+
+def start_seat(name, harness, beside_pane, cwd, mode, plan="a", model=None, effort=None):
+    program = PLANS[plan] if harness == "cc" else HARNESS[harness]
+    if program != HARNESS[harness] and world_of(beside_pane) != "app":
+        # The TUI's agent start runs only the canonical `claude`; claude-b needs the app's plain send.
+        raise SeatError(f"a plan {plan} seat opens only in the Herdr app; in the Herdr TUI start `{program}` by hand "
+                        f"in a pane, then name it there: seat name <role> [word]")
+    direction = split_direction(pane_rect(beside_pane))
+    pane = herdr("pane", "split", beside_pane, "--direction", direction, "--cwd", cwd, "--no-focus")["pane"]["pane_id"]
+    title = title_of(name)
+    native = ["--permission-mode", mode, "-n", title] if harness == "cc" else []
+    if harness == "cc":
+        native += (["--model", model] if model else []) + (["--effort", effort] if effort else [])
+    # A fresh pane's shell takes a moment to reach its prompt; Herdr answers agent_pane_busy until then.
+    for attempt in range(SHELL_WAIT_TRIES):
+        try:
+            herdr("agent", "start", name, "--kind", program, "--pane", pane, "--timeout", "60000", "--", *native)
+            herdr("pane", "rename", pane, title, check=False)
+            return pane
+        except SeatError as e:
+            if "agent_not_ready" in str(e):
+                raise SeatError(f"{name} started in {pane} but sits at a startup prompt (a folder trust question, "
+                                f"usually); answer it there and the seat is ready. The pane stays open.", 3)
+            if "agent_pane_busy" not in str(e) or attempt == SHELL_WAIT_TRIES - 1:
+                herdr("pane", "close", pane, check=False)
+                raise
+            time.sleep(0.5)
+
+
+def typed(line):
+    """The characters of an ANSI line drawn in a typed colour; grey or dim text is a hint, not a draft."""
+    out, faint, pos = [], False, 0
+    for m in list(SGR.finditer(line)) + [None]:
+        if not faint:
+            out.append(line[pos:m.start() if m else len(line)])
+        if not m:
+            break
+        codes, pos = m.group(1).split(";"), m.end()
+        if codes in ([""], ["0"]):
+            faint = False
+        elif codes[0] == "2":
+            faint = True
+        elif codes[:2] == ["38", "2"] and len(codes) >= 5:
+            r, g, b = map(int, codes[2:5])
+            faint = r == g == b and r < 200
+    return "".join(out)
+
+
+def draft_in(screen):
+    """Text sitting in a Claude input box: what lies between the last two rules, after the ❯ mark."""
+    lines = screen.splitlines()
+    rules = [i for i, l in enumerate(lines) if RULE.match(CSI.sub("", l))]
+    if len(rules) < 2:
+        return ""
+    box = "\n".join(typed(l) for l in lines[rules[-2] + 1:rules[-1]])
+    return box.replace("❯", "", 1).strip()
+
+
+def wait_for_empty_input(name, pane, limit=None):
+    """The owner may be typing in the seat's pane; a paste would join their draft. Wait until it is sent or cleared."""
+    pause, looks = DRAFT_WAIT
+    deadline = time.time() + (DRAFT_LIMIT if limit is None else limit)
+    for look in range(looks):
+        screen = herdr("pane", "read", pane, "--source", "visible", "--format", "ansi", check=False)
+        if not screen or not draft_in(screen):
+            return
+        if look < looks - 1 and time.time() + pause < deadline:
+            time.sleep(pause)
+        else:
+            break
+    raise SeatError(f"{name} has unsent text in its input box (the owner is typing); not sent. "
+                    f"Send again once it is sent or cleared.", 3)
+
+
+def prompt(name, text, live=None, draft_wait=None):
+    live = live if live is not None else agents()
+    agent = by_name(live, name)
+    if agent.get("agent_status") == "blocked":
+        raise SeatError(f"{name} is at an approval or question prompt; not sent (the owner answers it)", 3)
+    if agent.get("pane_id"):
+        wait_for_empty_input(name, agent["pane_id"], draft_wait)
+    herdr("agent", "prompt", name, text)
+    return agent.get("agent_status")
+
+
+# ---- commands ------------------------------------------------------------------------
+
+def cmd_open(a):
+    require_herdr()
+    repo = a.repo or repo_of(os.getcwd())
+    name = seat_name(repo, a.harness, a.role, a.word, a.successor)
+    live = agents()
+    if any(x.get("name") == name for x in live):
+        raise SeatError(f"{name} is already live; reuse it, pick another word, or open --successor", 3)
+    cwd = a.cwd or work_root(os.getcwd())
+    plan = a.plan or own_plan(live)
+    model, effort = run_on(a)
+    pane = start_seat(name, a.harness, here(), cwd, a.mode, plan, model, effort)
+    sent = ""
+    if a.brief:
+        prompt(name, with_header(read_text(a.brief), repo, a.about, me(live)))
+        sent = " · brief sent"
+    runs = " ".join(x for x in (model, effort) if x)
+    print(f"{name} · {pane} · {cwd}" + (f" · plan {plan}" + (f" · {runs}" if runs else "") if a.harness == "cc" else "") + sent)
+
+
+def cmd_name(a):
+    """Name the calling pane by the law; the seats mod then sets the Claude name with /rename."""
+    require_herdr()
+    repo = a.repo or repo_of(os.getcwd())
+    live = agents()
+    pane = here()
+    mine = next((x for x in live if x.get("pane_id") == pane), {})
+    harness = a.harness or ("cx" if mine.get("agent") == "codex" else "cc")
+    name = seat_name(repo, harness, a.role, a.word)
+    if mine.get("name") == name:
+        print(f"{name} · already named")
+        return
+    taken = next((x for x in live if x.get("name") == name), None)
+    if taken:
+        raise SeatError(f"{name} is live in pane {taken.get('pane_id')}; one {a.role} per name. "
+                        f"Hand that seat over or close it first", 3)
+    title = title_of(name)
+    herdr("agent", "rename", pane, name)
+    herdr("pane", "rename", pane, title, check=False)
+    print(f"{name} · {pane} · Herdr name set" + ("" if harness == "cx" else "; Claude name: /rename " + title))
+
+
+def cmd_send(a):
+    require_herdr()
+    repo = a.repo or repo_of(os.getcwd())
+    live = agents()
+    name = resolve(a.target, live, repo)
+    state = prompt(name, with_header(read_text(a.file), repo, a.about, me(live)), live, a.draft_wait)
+    print(f"sent to {name} ({state})")
+
+
+def session_id(agent):
+    sid = ((agent.get("agent_session") or {}).get("value") or "")
+    return sid if re.fullmatch(r"[0-9a-f-]{36}", sid) else None
+
+
+def cmd_list(a):
+    require_herdr()
+    repo = a.repo or repo_of(os.getcwd())
+    rows = []
+    live = agents()
+    mixed = len({x.get("world") for x in live}) > 1
+    for x in live:
+        name = x.get("name") or "unnamed"
+        if not a.all and not name.startswith(repo + "-") and repo_of(x.get("cwd") or "/") != repo:
+            continue
+        ctx = (x.get("tokens") or {}).get(CONTEXT_TOKEN, "")
+        title = x.get("terminal_title_stripped") or ""
+        where = f"{x.get('pane_id', '')} ({x.get('world')})" if mixed else x.get("pane_id", "")
+        rows.append((name, x.get("agent_status", "?"), ctx, where, Path(x.get("cwd") or "").name,
+                     title if title not in ("", name) else "", x.get("plan") or ""))
+    if not rows:
+        print(f"no seats in {repo}" + ("" if a.all else " (--all for every repo)"))
+    for r in sorted(rows):
+        print("  ".join(filter(None, [f"{r[0]:<32}", f"{r[1]:<8}", f"{r[2]:>6}" if r[2] else "", r[6], r[3], r[4], r[5]])))
+
+
+def cmd_handover(a):
+    """Successor beside the old seat, briefed with the pointer, then the swap.
+
+    A Lead keeps its old seat as <name>-advisor unless --close; anything else closes it. With an
+    advisor the name moves at once, since the old seat stays as the fallback; a close waits for
+    the successor to settle first. One advisor at a time: an idle one is closed for the next.
+    """
+    require_herdr()
+    repo = a.repo or repo_of(os.getcwd())
+    live = agents()
+    old = resolve(a.target, live, repo)
+    old_agent = by_name(live, old)
+    if a.close and a.keep:
+        raise SeatError("--close and --keep are opposites: close ends the old seat, keep leaves it as the advisor")
+    keep = a.keep or (not a.close and re.search(r"-lead$", old) is not None)
+    new = old + "-next"
+    advisor = old + "-advisor"
+    for n in (new, advisor if keep else new):
+        if not NAME.match(n):
+            raise SeatError(f"{n!r} is over Herdr's 32 characters; rename the seat to a shorter word first")
+    if any(x.get("name") == new for x in live):
+        raise SeatError(f"{new} is already live; finish or close that handover first", 3)
+    standing = next((x for x in live if x.get("name") == advisor), None) if keep else None
+    if standing and standing.get("agent_status") == "working" and not a.force:
+        raise SeatError(f"{advisor} is working; close it when idle (seat close {advisor}) or hand over with --force", 3)
+    harness = "cx" if old_agent.get("agent") == "codex" else "cc"
+    pointer = read_text(a.pointer)
+    if not pointer.strip():
+        raise SeatError("--pointer is required: the resume pointer the old seat printed at /seat-handover")
+    if standing:
+        herdr("pane", "close", standing["pane_id"])
+        print(f"{advisor} closed for the next advisor")
+    plan = a.plan or old_agent.get("plan") or own_plan(live)
+    model, effort = run_on(a)
+    pane = start_seat(new, harness, old_agent["pane_id"], old_agent.get("cwd") or work_root(os.getcwd()), a.mode, plan,
+                      model, effort)
+    prompt(new, successor_brief(old, pointer, transcript_of(old_agent)))
+    lead = next((x["name"] for x in live if (x.get("name") or "").startswith(repo + "-")
+                 and x["name"].endswith("-lead") and x["name"] not in (me(live), old)), None)
+    if keep:
+        # The old seat steps aside first, freeing the name every seat addresses. Titles never move.
+        herdr("agent", "rename", old, advisor)
+        herdr("agent", "rename", new, old)
+        herdr("agent", "prompt", advisor, f"{repo} · seat handover · you are the advisor now, as {advisor}. {old} "
+                                          f"holds your seat and directs. Think things through with the owner and "
+                                          f"answer their questions; direct nothing, dispatch nothing. A seat that "
+                                          f"reaches you is pointed to {old}. The next handover closes you.",
+              check=False)
+        if lead:
+            herdr("agent", "prompt", lead, f"{repo} · seat handover · {old} handed over; its successor holds the "
+                                           f"name, the old seat advises. No reply needed.", check=False)
+        print(f"{pane} · {old} is the successor, briefed; the old seat advises as {advisor} "
+              f"(close it when done: seat close advisor)")
+        return
+    print(f"{new} · {pane} · briefed; waiting for it to settle")
+    herdr("agent", "wait", new, "--timeout", str(a.timeout * 1000), check=False)
+    state = by_name(agents(), new).get("agent_status")
+    if state not in ("idle", "done"):
+        print(f"{new} is {state}; the old seat stays open. Check it, then: seat close {old}")
+        return
+    if old_agent.get("agent_status") == "working" and old_agent["pane_id"] != here() \
+            and not a.force:
+        raise SeatError(f"{old} is working; {new} is ready beside it. Close it when idle: seat close {old}", 3)
+    if lead:
+        herdr("agent", "prompt", lead, f"{repo} · seat handover · {old} handed over to its successor (swapped). "
+                                       f"No reply needed.", check=False)
+    # The name moves first and the pane closes last, so a seat handing itself over finishes the swap.
+    herdr("agent", "rename", old, "--clear")
+    herdr("agent", "rename", new, old)
+    print(f"{new} is now {old}; closing the old pane")
+    sys.stdout.flush()
+    herdr("pane", "close", old_agent["pane_id"])
+
+
+def transcript_of(agent, root=None):
+    """The predecessor's Claude transcript, from the session ID Herdr holds for its pane."""
+    sid = session_id(agent)
+    if not sid:
+        return None
+    hits = sorted(Path(root or Path.home() / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
+    return str(hits[0]) if hits else None
+
+
+def successor_brief(old, pointer, transcript):
+    lines = [f"You are the successor to {old}; you take its name when the handover completes.", "", pointer.strip()]
+    if transcript:
+        lines += ["", f"Your predecessor's transcript: {transcript}",
+                  "The handoff above is your source. Search the transcript (grep, or a subagent) only for "
+                  "something the handoff lacks, such as an exact command, error or owner wording; never read it whole."]
+    return "\n".join(lines)
+
+
+def close_pane(name, force=False):
+    agent = by_name(agents(), name)
+    if agent.get("agent_status") == "working" and not force:
+        raise SeatError(f"{name} is working; close it when idle, or --force", 3)
+    herdr("pane", "close", agent["pane_id"])
+
+
+def cmd_close(a):
+    require_herdr()
+    repo = a.repo or repo_of(os.getcwd())
+    name = resolve(a.target, agents(), repo)
+    close_pane(name, a.force)
+    print(f"{name} closed")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="seat", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--repo", help="override the repo segment (default: from the working directory)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    o = sub.add_parser("open", help="open a seat beside this pane")
+    o.add_argument("role", choices=ROLES)
+    o.add_argument("word", nargs="?")
+    o.add_argument("--harness", default="cc", choices=list(HARNESS))
+    o.add_argument("--successor", action="store_true", help="name it <name>-next while the old seat lives")
+    o.add_argument("--brief", help="file (or - for stdin) sent as its first message")
+    o.add_argument("--about", help="tracker for the message header")
+    o.add_argument("--cwd", help="start folder (default: this work folder)")
+    o.add_argument("--mode", default="auto", help="Claude permission mode (default auto, the owner's)")
+    o.add_argument("--plan", choices=list(PLANS), help="Claude plan: a (claude) or b (claude-b); default: this seat's")
+    o.add_argument("--model", help=f"model alias or ID (opus, fable, claude-fable-5-2); default {DEFAULT_MODEL}")
+    o.add_argument("--effort", choices=EFFORTS, help=f"default {DEFAULT_EFFORT}")
+    n = sub.add_parser("name", help="name this pane by the law (a seat opened by hand)")
+    n.add_argument("role", choices=ROLES)
+    n.add_argument("word", nargs="?")
+    n.add_argument("--harness", choices=list(HARNESS), help="default: this pane's agent")
+    s = sub.add_parser("send", help="message a seat")
+    s.add_argument("target")
+    s.add_argument("file", help="message file, or - for stdin")
+    s.add_argument("--about", help="tracker for the header")
+    s.add_argument("--draft-wait", type=float, help="seconds to wait for a draft in the target's input box (default 90)")
+    sub.add_parser("list", help="this repo's seats").add_argument("--all", action="store_true")
+    h = sub.add_parser("handover", help="open the successor, brief it, swap; a Lead's old seat advises")
+    h.add_argument("target")
+    h.add_argument("--pointer", required=True, help="file (or -) holding the resume pointer")
+    h.add_argument("--close", action="store_true", help="close the old seat (the default except for a Lead)")
+    h.add_argument("--keep", action="store_true", help="keep the old seat as <name>-advisor (the default for a Lead)")
+    h.add_argument("--force", action="store_true")
+    h.add_argument("--timeout", type=int, default=600, help="seconds to wait for the successor to settle")
+    h.add_argument("--mode", default="auto")
+    h.add_argument("--plan", choices=list(PLANS), help="default: the old seat's plan")
+    h.add_argument("--model", help=f"model alias or ID for the successor; default {DEFAULT_MODEL}")
+    h.add_argument("--effort", choices=EFFORTS, help=f"default {DEFAULT_EFFORT}")
+    c = sub.add_parser("close", help="close a seat's pane")
+    c.add_argument("target")
+    c.add_argument("--force", action="store_true")
+    a = ap.parse_args(argv)
+    try:
+        {"open": cmd_open, "name": cmd_name, "send": cmd_send, "list": cmd_list, "handover": cmd_handover, "close": cmd_close}[a.cmd](a)
+    except SeatError as e:
+        print(f"seat: {e}", file=sys.stderr)
+        return e.code
+    except (OSError, StopIteration) as e:
+        print(f"seat: {e or 'seat vanished mid-command'}", file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
